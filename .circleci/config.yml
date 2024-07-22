@@ -1,0 +1,221 @@
+version: 2
+defaults: &defaults
+  working_directory: ~/ifmeorg/ifme
+  parallelism: 1
+  shell: /bin/bash --login
+  environment:
+    CIRCLE_ARTIFACTS: /tmp/circleci-artifacts
+    CIRCLE_TEST_REPORTS: /tmp/circleci-test-results
+  docker:
+    # List of image tags: https://circleci.com/developer/images/image/cimg/ruby#image-tags
+    - image: cimg/ruby:3.1.4-browsers
+      environment:
+        PGHOST: 127.0.0.1
+        PGUSER: circleci
+        NODE_ENV: test
+    - image: circleci/postgres:9.5-alpine
+      environment:
+        POSTGRES_USER: circleci
+        POSTGRES_DB: ifme_test
+        POSTGRES_PASSWORD: ""
+    - image: redis
+      environment:
+        REDIS_HOST: redis
+        # The default Redis port
+        REDIS_PORT: 6379
+  steps:
+    - checkout
+jobs:
+  setup-coverage:
+    <<: *defaults
+    steps:
+      - checkout
+      - run:
+          name: Download cc-test-reporter
+          command: |
+            mkdir -p tmp/
+            curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./tmp/cc-test-reporter
+            chmod +x ./tmp/cc-test-reporter
+      - persist_to_workspace:
+          root: tmp
+          paths:
+            - cc-test-reporter
+  build:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/ifmeorg/ifme/tmp
+      - run: mkdir -p $CIRCLE_ARTIFACTS $CIRCLE_TEST_REPORTS
+      - restore_cache:
+          keys:
+          - v1-dep-{{ .Branch }}-
+          - v1-dep-main-
+          - v1-dep-
+      - run:
+          name: Swap node versions
+          command: |
+            set +e
+            wget -qO- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.1/install.sh | bash
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+            nvm install v16.14
+            nvm alias default 16.14
+
+            echo 'export NVM_DIR="$HOME/.nvm"' >> $BASH_ENV
+            echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> $BASH_ENV
+      - run: gem install bundler
+      - run: bundle install --path=vendor/bundle --jobs=4 --retry=3
+      - run: yarn install --cache-folder ~/.cache/yarn
+      - run:
+          name: Setup Chrome
+          command: |
+            wget http://archive.ubuntu.com/ubuntu/pool/main/libu/libu2f-host/libu2f-udev_1.1.10-1_all.deb
+            sudo dpkg -i libu2f-udev_1.1.10-1_all.deb
+            wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo dpkg -i ./google-chrome*.deb
+            sudo apt-get install
+      - save_cache:
+          key: v1-dep-{{ .Branch }}-{{ epoch }}
+          paths:
+          - ~/.cache/yarn
+          - ./node_modules
+          - ./vendor/bundle
+      - run: dockerize -wait tcp://localhost:5432 -timeout 1m
+      - run:
+          command: bundle exec rake db:create db:schema:load --trace
+          environment:
+            RAILS_ENV: test
+            RACK_ENV: test
+      - run: RAILS_ENV=test bundle exec rake db:create db:schema:load
+      - run: RAILS_ENV=test bundle exec rake react_on_rails:locale
+      - run: RAILS_ENV=test bundle exec rails assets:precompile
+      - run:
+          name: Run React Jest Tests
+          command: |
+            set -e
+            (cd client && yarn lint:flow && yarn lint:eslint && yarn test:circleci)
+            (cd client && ../tmp/cc-test-reporter format-coverage -t lcov -o ../tmp/codeclimate.frontend.json coverage/lcov.info)
+      - persist_to_workspace:
+          root: tmp
+          paths:
+            - codeclimate.frontend.json
+      - run:
+          name: Run Rails Rspec Tests
+          command: |
+            set -e
+            bundle exec rspec --format progress --format RspecJunitFormatter -o $CIRCLE_TEST_REPORTS/rspec.xml
+            cd ~/ifmeorg/ifme/tmp && ./cc-test-reporter format-coverage -t simplecov -o codeclimate.backend.json ../coverage/.resultset.json
+      - persist_to_workspace:
+          root: tmp
+          paths:
+            - codeclimate.backend.json
+      - run: bundle exec bundle-audit check --update
+      - store_test_results:
+          path: /tmp/circleci-test-results
+      - store_artifacts:
+          path: /tmp/circleci-artifacts
+      - store_artifacts:
+          path: /tmp/circleci-test-results
+  upload-coverage:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: ~/ifmeorg/ifme/tmp
+      - run:
+          name: Upload coverage results to Code Climate
+          command: |
+            ./tmp/cc-test-reporter sum-coverage --output tmp/codeclimate.total.json --parts 2 tmp/codeclimate.*.json
+            sed -i.bak 's@"/home/circleci/ifmeorg/ifme/@"@' tmp/codeclimate.total.json
+            ./tmp/cc-test-reporter upload-coverage -i tmp/codeclimate.total.json
+  deploy:
+    docker:
+      # TODO: Update this to correct cimg/base
+      - image: buildpack-deps:trusty
+    steps:
+      - checkout
+      - run:
+          name: Deploy Main to Heroku
+          command: |
+            GIT_CURL_VERBOSE=1 GIT_TRACE=1 git push https://heroku:$HEROKU_API_KEY@git.heroku.com/ifme.git main
+  deploy-storybook:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/ifmeorg/ifme/tmp
+      - restore_cache:
+          keys:
+          - v1-dep-{{ .Branch }}-
+          - v1-dep-main-
+          - v1-dep-
+      - run:
+          name: Update to Node v16.14.2
+          command: |
+            curl -sSL "https://nodejs.org/dist/v16.14.2/node-v16.14.2-linux-x64.tar.xz" | sudo tar --strip-components=2 -xJ -C /usr/local/bin/ node-v16.14.2-linux-x64/bin/node
+            curl https://www.npmjs.com/install.sh | sudo bash
+      - run: gem install bundler
+      - run: bundle install --path=vendor/bundle --jobs=4 --retry=3
+      - run: yarn install --cache-folder ~/.cache/yarn
+      - run:
+          name: Deploy Storybook
+          command: |
+            cd client
+            yarn deploy:storybook
+      - save_cache:
+          key: v1-dep-{{ .Branch }}-{{ epoch }}
+          paths:
+          - ~/.cache/yarn
+          - ./node_modules
+          - ./vendor/bundle
+
+workflows:
+  version: 2
+  build-test:
+    jobs:
+      - setup-coverage
+      - build:
+          requires:
+            - setup-coverage
+      - upload-coverage:
+          requires:
+            - build
+  build-test-deploy:
+    jobs:
+      - setup-coverage:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+/
+      - build:
+          requires:
+            - setup-coverage
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+/
+      - upload-coverage:
+          requires:
+            - build
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+/
+      - deploy:
+          requires:
+            - upload-coverage
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+/
+      - deploy-storybook:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+/
